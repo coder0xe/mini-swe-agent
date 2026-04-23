@@ -6,9 +6,12 @@ There are three modes:
 - yolo: commands issued by the LM are executed immediately without confirmation
 """
 
+from __future__ import annotations
+
 import re
 from typing import Literal, NoReturn
 
+from opentelemetry import trace
 from rich.console import Console
 from rich.rule import Rule
 
@@ -16,8 +19,18 @@ from minisweagent.agents.default import AgentConfig, DefaultAgent
 from minisweagent.agents.utils.prompt_user import _multiline_prompt, prompt_session
 from minisweagent.exceptions import LimitsExceeded, Submitted, UserInterruption
 from minisweagent.models.utils.content_string import get_content_string
+from minisweagent.utils.tracing import (
+    get_action_command,
+    mark_span_error,
+    mark_span_ok,
+    preview_json,
+    preview_text,
+    set_openinference_kind,
+    set_span_attributes,
+)
 
 console = Console(highlight=False)
+tracer = trace.get_tracer(__name__)
 
 
 class InteractiveAgentConfig(AgentConfig):
@@ -56,61 +69,147 @@ class InteractiveAgent(DefaultAgent):
 
     def query(self) -> dict:
         # Extend supermethod to handle human mode
-        if self.config.mode == "human":
-            match command := self._prompt_and_handle_slash_commands("[bold yellow]>[/bold yellow] "):
-                case "/y" | "/c":
-                    pass
-                case _:
-                    msg = {
-                        "role": "user",
-                        "content": f"User command: \n```bash\n{command}\n```",
-                        "extra": {"actions": [{"command": command}]},
-                    }
-                    self.add_messages(msg)
-                    return msg
-        try:
-            with console.status("Waiting for the LM to respond..."):
-                return super().query()
-        except LimitsExceeded:
-            console.print(
-                f"Limits exceeded. Limits: {self.config.step_limit} steps, ${self.config.cost_limit}.\n"
-                f"Current spend: {self.n_calls} steps, ${self.cost:.2f}."
+        step_index = self.n_calls + 1
+        with tracer.start_as_current_span("agent.query") as span:
+            set_openinference_kind(span, "CHAIN")
+            set_span_attributes(
+                span,
+                {
+                    "mini.step_index": step_index,
+                    "mini.interactive_mode": self.config.mode,
+                    "mini.message_count": len(self.messages),
+                    "input.value": preview_json(self.messages[-3:] if self.messages else []),
+                },
             )
-            self.config.step_limit = int(input("New step limit: "))
-            self.config.cost_limit = float(input("New cost limit: "))
-            return super().query()
+            try:
+                if self.config.mode == "human":
+                    match command := self._prompt_and_handle_slash_commands("[bold yellow]>[/bold yellow] "):
+                        case "/y" | "/c":
+                            pass
+                        case _:
+                            msg = {
+                                "role": "user",
+                                "content": f"User command: \n```bash\n{command}\n```",
+                                "extra": {"actions": [{"command": command}]},
+                            }
+                            self.add_messages(msg)
+                            set_span_attributes(
+                                span,
+                                {
+                                    "output.value": preview_json(msg),
+                                    "mini.query_source": "human",
+                                    "mini.action_count": 1,
+                                },
+                            )
+                            mark_span_ok(span)
+                            return msg
+                try:
+                    with console.status("Waiting for the LM to respond..."):
+                        message = self._query_impl()
+                except LimitsExceeded:
+                    console.print(
+                        f"Limits exceeded. Limits: {self.config.step_limit} steps, ${self.config.cost_limit}.\n"
+                        f"Current spend: {self.n_calls} steps, ${self.cost:.2f}."
+                    )
+                    self.config.step_limit = int(input("New step limit: "))
+                    self.config.cost_limit = float(input("New cost limit: "))
+                    message = self._query_impl()
+                set_span_attributes(
+                    span,
+                    {
+                        "output.value": preview_json(message),
+                        "mini.query_source": "llm",
+                        "mini.action_count": len(message.get("extra", {}).get("actions", [])),
+                        "llm.cost.total": self.cost,
+                    },
+                )
+                mark_span_ok(span)
+                return message
+            except Exception as e:
+                mark_span_error(span, e)
+                raise
 
     def step(self) -> list[dict]:
         # Override the step method to handle user interruption
-        try:
-            console.print(Rule())
-            return super().step()
-        except KeyboardInterrupt:
-            interruption_message = self._prompt_and_handle_slash_commands(
-                "\n\n[bold yellow]Interrupted.[/bold yellow] "
-                "[green]Type a comment/command[/green] (/h for available commands)"
-                "\n[bold yellow]>[/bold yellow] "
-            ).strip()
-            if not interruption_message or interruption_message in self._MODE_COMMANDS_MAPPING:
-                interruption_message = "Temporary interruption caught."
-            self._interrupt(f"Interrupted by user: {interruption_message}")
+        step_index = self.n_calls + 1
+        with tracer.start_as_current_span("agent.step") as span:
+            set_openinference_kind(span, "CHAIN")
+            set_span_attributes(
+                span,
+                {
+                    "mini.step_index": step_index,
+                    "mini.interactive_mode": self.config.mode,
+                    "mini.messages_before": len(self.messages),
+                    "llm.cost.total": self.cost,
+                },
+            )
+            try:
+                console.print(Rule())
+                result = self._step_impl()
+                set_span_attributes(span, {"mini.messages_after": len(self.messages)})
+                mark_span_ok(span)
+                return result
+            except KeyboardInterrupt:
+                interruption_message = self._prompt_and_handle_slash_commands(
+                    "\n\n[bold yellow]Interrupted.[/bold yellow] "
+                    "[green]Type a comment/command[/green] (/h for available commands)"
+                    "\n[bold yellow]>[/bold yellow] "
+                ).strip()
+                if not interruption_message or interruption_message in self._MODE_COMMANDS_MAPPING:
+                    interruption_message = "Temporary interruption caught."
+                interruption_error = UserInterruption(
+                    {
+                        "role": "user",
+                        "content": f"Interrupted by user: {interruption_message}",
+                        "extra": {"interrupt_type": "UserInterruption"},
+                    }
+                )
+                mark_span_error(span, interruption_error)
+                raise interruption_error
+            except Exception as e:
+                mark_span_error(span, e)
+                raise
 
     def execute_actions(self, message: dict) -> list[dict]:
         # Override to handle user confirmation and confirm_exit, with try/finally to preserve partial outputs
-        actions = message.get("extra", {}).get("actions", [])
-        commands = [action["command"] for action in actions]
+        step_index = self.n_calls
+        actions = self._annotate_actions(message.get("extra", {}).get("actions", []), step_index=step_index)
+        commands = [get_action_command(action) for action in actions]
         outputs = []
-        try:
-            self._ask_confirmation_or_interrupt(commands)
-            for action in actions:
-                outputs.append(self.env.execute(action))
-        except Submitted as e:
-            self._check_for_new_task_or_submit(e)
-        finally:
-            result = self.add_messages(
-                *self.model.format_observation_messages(message, outputs, self.get_template_vars())
+        with tracer.start_as_current_span("agent.execute_actions") as span:
+            set_openinference_kind(span, "CHAIN")
+            set_span_attributes(
+                span,
+                {
+                    "mini.step_index": step_index,
+                    "mini.interactive_mode": self.config.mode,
+                    "mini.action_count": len(actions),
+                    "input.value": preview_json(commands),
+                },
             )
-        return result
+            try:
+                self._ask_confirmation_or_interrupt(commands)
+                for action in actions:
+                    outputs.append(self.env.execute(action))
+            except Submitted as e:
+                self._check_for_new_task_or_submit(e)
+            except Exception as e:
+                mark_span_error(span, e)
+                raise
+            finally:
+                result = self.add_messages(
+                    *self.model.format_observation_messages(message, outputs, self.get_template_vars())
+                )
+            set_span_attributes(
+                span,
+                {
+                    "output.value": preview_json(outputs),
+                    "mini.output_count": len(outputs),
+                    "mini.partial_output_preview": preview_text(outputs[-1].get("output", ""), 1000) if outputs else "",
+                },
+            )
+            mark_span_ok(span)
+            return result
 
     def _add_observation_messages(self, message: dict, outputs: list[dict]) -> list[dict]:
         return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))

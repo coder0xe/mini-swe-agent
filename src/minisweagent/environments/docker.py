@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 import platform
@@ -6,10 +8,24 @@ import subprocess
 import uuid
 from typing import Any
 
+from opentelemetry import trace
 from pydantic import BaseModel
 
 from minisweagent.exceptions import Submitted
 from minisweagent.utils.serialize import recursive_merge
+from minisweagent.utils.tracing import (
+    get_action_command,
+    get_trace_meta,
+    mark_span_error,
+    mark_span_ok,
+    normalize_action,
+    preview_json,
+    preview_text,
+    set_openinference_kind,
+    set_span_attributes,
+)
+
+tracer = trace.get_tracer(__name__)
 
 
 class DockerEnvironmentConfig(BaseModel):
@@ -55,6 +71,7 @@ class DockerEnvironment:
         """
         self.logger = logger or logging.getLogger("minisweagent.environment")
         self.container_id: str | None = None
+        self.container_name: str | None = None
         self.config = config_class(**kwargs)
         self._start_container()
 
@@ -88,19 +105,46 @@ class DockerEnvironment:
             self.config.container_timeout,
         ]
         self.logger.debug(f"Starting container with command: {shlex.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=self.config.pull_timeout,  # docker pull might take a while
-            check=True,
-        )
-        self.logger.info(f"Started container {container_name} with ID {result.stdout.strip()}")
-        self.container_id = result.stdout.strip()
+        with tracer.start_as_current_span("sandbox.start") as span:
+            set_openinference_kind(span, "CHAIN")
+            set_span_attributes(
+                span,
+                {
+                    "input.value": shlex.join(cmd),
+                    "mini.sandbox.backend": "docker",
+                    "mini.sandbox.image": self.config.image,
+                    "mini.sandbox.cwd": self.config.cwd,
+                    "mini.sandbox.container_name": container_name,
+                },
+            )
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.pull_timeout,  # docker pull might take a while
+                    check=True,
+                )
+                self.logger.info(f"Started container {container_name} with ID {result.stdout.strip()}")
+                self.container_id = result.stdout.strip()
+                self.container_name = container_name
+                set_span_attributes(
+                    span,
+                    {
+                        "output.value": preview_text(result.stdout),
+                        "mini.sandbox.container_id": self.container_id,
+                    },
+                )
+                mark_span_ok(span)
+            except Exception as e:
+                mark_span_error(span, e)
+                raise
 
-    def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
+    def execute(self, action: dict | str, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
         """Execute a command in the Docker container and return the result as a dict."""
-        command = action.get("command", "")
+        action_dict = normalize_action(action)
+        command = get_action_command(action_dict)
+        trace_meta = get_trace_meta(action_dict)
         cwd = cwd or self.config.cwd
         assert self.container_id, "Container not started"
 
@@ -112,30 +156,78 @@ class DockerEnvironment:
             cmd.extend(["-e", f"{key}={value}"])
         cmd.extend([self.container_id, *self.config.interpreter, command])
 
-        try:
-            result = subprocess.run(
-                cmd,
-                text=True,
-                timeout=timeout or self.config.timeout,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+        with tracer.start_as_current_span("tool.exec") as span:
+            set_openinference_kind(span, "TOOL")
+            set_span_attributes(
+                span,
+                {
+                    "input.value": preview_text(command),
+                    "tool.name": "bash",
+                    "tool.parameters": preview_json({"cwd": cwd, "timeout": timeout or self.config.timeout}),
+                    "mini.tool.backend": "docker",
+                    "mini.tool.command": command,
+                    "mini.tool.wrapper_command": shlex.join(cmd),
+                    "mini.tool.cwd": cwd,
+                    "mini.step_index": trace_meta.get("step_index"),
+                    "mini.action_index": trace_meta.get("action_index"),
+                    "mini.agent_class": trace_meta.get("agent_class"),
+                    "mini.sandbox.container_id": self.container_id,
+                    "mini.sandbox.container_name": self.container_name,
+                    "mini.sandbox.image": self.config.image,
+                },
             )
-            output = {"output": result.stdout, "returncode": result.returncode, "exception_info": ""}
-        except Exception as e:
-            raw_output = getattr(e, "output", None)
-            raw_output = (
-                raw_output.decode("utf-8", errors="replace") if isinstance(raw_output, bytes) else (raw_output or "")
-            )
-            output = {
-                "output": raw_output,
-                "returncode": -1,
-                "exception_info": f"An error occurred while executing the command: {e}",
-                "extra": {"exception_type": type(e).__name__, "exception": str(e)},
-            }
-        self._check_finished(output)
-        return output
+            try:
+                result = subprocess.run(
+                    cmd,
+                    text=True,
+                    timeout=timeout or self.config.timeout,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                output = {"output": result.stdout, "returncode": result.returncode, "exception_info": ""}
+                set_span_attributes(
+                    span,
+                    {
+                        "output.value": preview_text(result.stdout),
+                        "mini.tool.returncode": result.returncode,
+                    },
+                )
+                self._check_finished(output)
+                mark_span_ok(span)
+                return output
+            except Submitted as e:
+                set_span_attributes(
+                    span,
+                    {
+                        "mini.tool.returncode": 0,
+                        "output.value": preview_text(e.args[0].get("content", "") if e.args else ""),
+                        "mini.tool.submitted": True,
+                    },
+                )
+                mark_span_ok(span)
+                raise
+            except Exception as e:
+                raw_output = getattr(e, "output", None)
+                raw_output = (
+                    raw_output.decode("utf-8", errors="replace") if isinstance(raw_output, bytes) else (raw_output or "")
+                )
+                output = {
+                    "output": raw_output,
+                    "returncode": -1,
+                    "exception_info": f"An error occurred while executing the command: {e}",
+                    "extra": {"exception_type": type(e).__name__, "exception": str(e)},
+                }
+                set_span_attributes(
+                    span,
+                    {
+                        "output.value": preview_text(raw_output),
+                        "mini.tool.returncode": -1,
+                    },
+                )
+                mark_span_error(span, e)
+                return output
 
     def _check_finished(self, output: dict):
         """Raises Submitted if the output indicates task completion."""
@@ -153,8 +245,28 @@ class DockerEnvironment:
     def cleanup(self):
         """Stop and remove the Docker container."""
         if getattr(self, "container_id", None) is not None:  # if init fails early, container_id might not be set
-            cmd = f"(timeout 60 {self.config.executable} stop {self.container_id} || {self.config.executable} rm -f {self.container_id}) >/dev/null 2>&1 &"
-            subprocess.Popen(cmd, shell=True)
+            cmd = (
+                f"(timeout 60 {self.config.executable} stop {self.container_id} || "
+                f"{self.config.executable} rm -f {self.container_id}) >/dev/null 2>&1 &"
+            )
+            with tracer.start_as_current_span("sandbox.cleanup") as span:
+                set_openinference_kind(span, "CHAIN")
+                set_span_attributes(
+                    span,
+                    {
+                        "input.value": cmd,
+                        "mini.sandbox.backend": "docker",
+                        "mini.sandbox.container_id": self.container_id,
+                        "mini.sandbox.container_name": self.container_name,
+                        "mini.sandbox.image": self.config.image,
+                    },
+                )
+                try:
+                    subprocess.Popen(cmd, shell=True)
+                    mark_span_ok(span)
+                except Exception as e:
+                    mark_span_error(span, e)
+                    raise
 
     def __del__(self):
         """Cleanup container when object is destroyed."""

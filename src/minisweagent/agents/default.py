@@ -2,17 +2,33 @@
 or https://minimal-agent.com for a tutorial on the basic building principles.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import traceback
 from pathlib import Path
+from typing import Any
 
 from jinja2 import StrictUndefined, Template
+from opentelemetry import trace
 from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import InterruptAgentFlow, LimitsExceeded
 from minisweagent.utils.serialize import recursive_merge
+from minisweagent.utils.tracing import (
+    get_action_command,
+    mark_span_error,
+    mark_span_ok,
+    normalize_action,
+    preview_json,
+    preview_text,
+    set_openinference_kind,
+    set_span_attributes,
+)
+
+tracer = trace.get_tracer(__name__)
 
 
 class AgentConfig(BaseModel):
@@ -74,34 +90,90 @@ class DefaultAgent:
             )
         )
 
+    def _run_span_attributes(self, task: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        model_name = getattr(getattr(self.model, "config", None), "model_name", None)
+        return {
+            "input.value": preview_text(task, 4000),
+            "agent.class": self.__class__.__name__,
+            "agent.module": self.__class__.__module__,
+            "agent.step_limit": self.config.step_limit,
+            "agent.cost_limit": self.config.cost_limit,
+            "environment.class": self.env.__class__.__name__,
+            "environment.module": self.env.__class__.__module__,
+            "llm.model_name": model_name,
+            "metadata": preview_json(kwargs),
+            "mini.instance_id": kwargs.get("instance_id"),
+            "mini.subset": kwargs.get("subset") or kwargs.get("benchmark_subset"),
+            "mini.split": kwargs.get("split") or kwargs.get("benchmark_split"),
+        }
+
     def run(self, task: str = "", **kwargs) -> dict:
         """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
-        self.extra_template_vars |= {"task": task, **kwargs}
-        self.messages = []
-        self.add_messages(
-            self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
-            self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
-        )
-        while True:
+        with tracer.start_as_current_span("agent.run") as span:
+            set_openinference_kind(span, "AGENT")
+            set_span_attributes(span, self._run_span_attributes(task, kwargs))
             try:
-                self.step()
-            except InterruptAgentFlow as e:
-                self.add_messages(*e.messages)
+                self.extra_template_vars |= {"task": task, **kwargs}
+                self.messages = []
+                self.add_messages(
+                    self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
+                    self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
+                )
+                while True:
+                    try:
+                        self.step()
+                    except InterruptAgentFlow as e:
+                        self.add_messages(*e.messages)
+                    except Exception as e:
+                        self.handle_uncaught_exception(e)
+                        raise
+                    finally:
+                        self.save(self.config.output_path)
+                    if self.messages[-1].get("role") == "exit":
+                        break
+                result = self.messages[-1].get("extra", {})
+                set_span_attributes(
+                    span,
+                    {
+                        "output.value": preview_json(result),
+                        "mini.exit_status": result.get("exit_status"),
+                        "mini.submission_preview": preview_text(result.get("submission", ""), 1000),
+                        "mini.api_calls": self.n_calls,
+                        "llm.cost.total": self.cost,
+                    },
+                )
+                mark_span_ok(span)
+                return result
             except Exception as e:
-                self.handle_uncaught_exception(e)
+                mark_span_error(span, e)
                 raise
-            finally:
-                self.save(self.config.output_path)
-            if self.messages[-1].get("role") == "exit":
-                break
-        return self.messages[-1].get("extra", {})
+
+    def _step_impl(self) -> list[dict]:
+        return self.execute_actions(self.query())
 
     def step(self) -> list[dict]:
         """Query the LM, execute actions."""
-        return self.execute_actions(self.query())
+        step_index = self.n_calls + 1
+        with tracer.start_as_current_span("agent.step") as span:
+            set_openinference_kind(span, "CHAIN")
+            set_span_attributes(
+                span,
+                {
+                    "mini.step_index": step_index,
+                    "mini.messages_before": len(self.messages),
+                    "llm.cost.total": self.cost,
+                },
+            )
+            try:
+                result = self._step_impl()
+                set_span_attributes(span, {"mini.messages_after": len(self.messages)})
+                mark_span_ok(span)
+                return result
+            except Exception as e:
+                mark_span_error(span, e)
+                raise
 
-    def query(self) -> dict:
-        """Query the model and return model messages. Override to add hooks."""
+    def _query_impl(self) -> dict:
         if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
             raise LimitsExceeded(
                 {
@@ -116,10 +188,80 @@ class DefaultAgent:
         self.add_messages(message)
         return message
 
+    def query(self) -> dict:
+        """Query the model and return model messages. Override to add hooks."""
+        step_index = self.n_calls + 1
+        with tracer.start_as_current_span("agent.query") as span:
+            set_openinference_kind(span, "CHAIN")
+            set_span_attributes(
+                span,
+                {
+                    "mini.step_index": step_index,
+                    "input.value": preview_json(self.messages[-3:] if self.messages else []),
+                    "mini.message_count": len(self.messages),
+                },
+            )
+            try:
+                message = self._query_impl()
+                actions = message.get("extra", {}).get("actions", [])
+                set_span_attributes(
+                    span,
+                    {
+                        "output.value": preview_json(message),
+                        "mini.action_count": len(actions),
+                        "llm.cost.total": self.cost,
+                    },
+                )
+                mark_span_ok(span)
+                return message
+            except Exception as e:
+                mark_span_error(span, e)
+                raise
+
+    def _annotate_actions(self, actions: list[Any], *, step_index: int) -> list[dict[str, Any]]:
+        annotated: list[dict[str, Any]] = []
+        for action_index, raw_action in enumerate(actions):
+            action = normalize_action(raw_action)
+            trace_meta = dict(action.get("_trace_meta", {})) if isinstance(action.get("_trace_meta"), dict) else {}
+            trace_meta |= {
+                "step_index": step_index,
+                "action_index": action_index,
+                "agent_class": self.__class__.__name__,
+            }
+            action["_trace_meta"] = trace_meta
+            annotated.append(action)
+        return annotated
+
+    def _execute_actions_impl(self, message: dict, *, step_index: int) -> list[dict]:
+        actions = self._annotate_actions(message.get("extra", {}).get("actions", []), step_index=step_index)
+        outputs = [self.env.execute(action) for action in actions]
+        return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
+
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
-        outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
-        return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
+        step_index = self.n_calls
+        actions = self._annotate_actions(message.get("extra", {}).get("actions", []), step_index=step_index)
+        with tracer.start_as_current_span("agent.execute_actions") as span:
+            set_openinference_kind(span, "CHAIN")
+            set_span_attributes(
+                span,
+                {
+                    "mini.step_index": step_index,
+                    "mini.action_count": len(actions),
+                    "input.value": preview_json([get_action_command(action) for action in actions]),
+                },
+            )
+            try:
+                outputs = [self.env.execute(action) for action in actions]
+                result = self.add_messages(
+                    *self.model.format_observation_messages(message, outputs, self.get_template_vars())
+                )
+                set_span_attributes(span, {"output.value": preview_json(outputs)})
+                mark_span_ok(span)
+                return result
+            except Exception as e:
+                mark_span_error(span, e)
+                raise
 
     def serialize(self, *extra_dicts) -> dict:
         """Serialize agent state to a json-compatible nested dictionary for saving."""

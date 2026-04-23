@@ -3,6 +3,8 @@
 """Run mini-SWE-agent on SWE-bench instances in batch mode."""
 # Read this first: https://mini-swe-agent.com/latest/usage/swebench/  (usage docs)
 
+from __future__ import annotations
+
 import concurrent.futures
 import json
 import random
@@ -14,6 +16,7 @@ from pathlib import Path
 
 import typer
 from jinja2 import StrictUndefined, Template
+from opentelemetry import trace
 from rich.live import Live
 
 from minisweagent import Environment
@@ -24,6 +27,9 @@ from minisweagent.models import get_model
 from minisweagent.run.benchmarks.utils.batch_progress import RunBatchProgressManager
 from minisweagent.utils.log import add_file_handler, logger
 from minisweagent.utils.serialize import UNSET, recursive_merge
+from minisweagent.utils.tracing import mark_span_error, mark_span_ok, preview_json, set_openinference_kind, set_span_attributes
+
+tracer = trace.get_tracer(__name__)
 
 _HELP_TEXT = """Run mini-SWE-agent on SWEBench instances.
 
@@ -91,21 +97,45 @@ def get_swebench_docker_image_name(instance: dict) -> str:
 
 
 def get_sb_environment(config: dict, instance: dict) -> Environment:
-    env_config = config.setdefault("environment", {})
-    env_config["environment_class"] = env_config.get("environment_class", "docker")
-    image_name = get_swebench_docker_image_name(instance)
-    if env_config["environment_class"] in ["docker", "swerex_modal"]:
-        env_config["image"] = image_name
-    elif env_config["environment_class"] in ["singularity", "contree"]:
-        env_config["image"] = "docker://" + image_name
+    with tracer.start_as_current_span("benchmark.get_environment") as span:
+        set_openinference_kind(span, "CHAIN")
+        set_span_attributes(
+            span,
+            {
+                "mini.instance_id": instance.get("instance_id"),
+                "metadata": preview_json({"instance": {"instance_id": instance.get("instance_id")}}),
+            },
+        )
+        try:
+            env_config = config.setdefault("environment", {})
+            env_config["environment_class"] = env_config.get("environment_class", "docker")
+            image_name = get_swebench_docker_image_name(instance)
+            if env_config["environment_class"] in ["docker", "swerex_modal"]:
+                env_config["image"] = image_name
+            elif env_config["environment_class"] in ["singularity", "contree"]:
+                env_config["image"] = "docker://" + image_name
 
-    env = get_environment(env_config)
-    if startup_command := config.get("run", {}).get("env_startup_command"):
-        startup_command = Template(startup_command, undefined=StrictUndefined).render(**instance)
-        out = env.execute(startup_command)
-        if out["returncode"] != 0:
-            raise RuntimeError(f"Error executing startup command: {out}")
-    return env
+            set_span_attributes(
+                span,
+                {
+                    "mini.environment_class": env_config.get("environment_class"),
+                    "mini.environment_image": env_config.get("image"),
+                },
+            )
+            env = get_environment(env_config)
+            if startup_command := config.get("run", {}).get("env_startup_command"):
+                startup_command = Template(startup_command, undefined=StrictUndefined).render(**instance)
+                out = env.execute({
+                    "command": startup_command,
+                    "_trace_meta": {"step_index": 0, "action_index": -1, "agent_class": "EnvironmentStartup"},
+                })
+                if out["returncode"] != 0:
+                    raise RuntimeError(f"Error executing startup command: {out}")
+            mark_span_ok(span)
+            return env
+        except Exception as e:
+            mark_span_error(span, e)
+            raise
 
 
 def update_preds_file(output_path: Path, instance_id: str, model_name: str, result: str):
@@ -152,43 +182,79 @@ def process_instance(
     progress_manager.update_instance_status(instance_id, "Pulling/starting environment")
 
     agent = None
+    env = None
     exit_status = None
     result = None
     extra_info = {}
 
-    try:
-        env = get_sb_environment(config, instance)
-        agent = ProgressTrackingAgent(
-            model,
-            env,
-            progress_manager=progress_manager,
-            instance_id=instance_id,
-            **config.get("agent", {}),
+    with tracer.start_as_current_span("benchmark.instance_run") as span:
+        set_openinference_kind(span, "AGENT")
+        set_span_attributes(
+            span,
+            {
+                "mini.instance_id": instance_id,
+                "mini.run.subset": config.get("run", {}).get("subset", ""),
+                "mini.run.split": config.get("run", {}).get("split", ""),
+                "mini.output_dir": str(output_dir),
+                "input.value": task,
+                "metadata": preview_json(
+                    {
+                        "instance_id": instance_id,
+                        "subset": config.get("run", {}).get("subset", ""),
+                        "split": config.get("run", {}).get("split", ""),
+                    }
+                ),
+            },
         )
-        info = agent.run(task)
-        exit_status = info.get("exit_status")
-        result = info.get("submission")
-    except Exception as e:
-        logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
-        exit_status, result = type(e).__name__, ""
-        extra_info = {"traceback": traceback.format_exc(), "exception_str": str(e)}
-    finally:
-        if agent is not None:
-            traj_path = instance_dir / f"{instance_id}.traj.json"
-            agent.save(
-                traj_path,
+        try:
+            env = get_sb_environment(config, instance)
+            agent = ProgressTrackingAgent(
+                model,
+                env,
+                progress_manager=progress_manager,
+                instance_id=instance_id,
+                **config.get("agent", {}),
+            )
+            info = agent.run(
+                task,
+                instance_id=instance_id,
+                benchmark_subset=config.get("run", {}).get("subset", ""),
+                benchmark_split=config.get("run", {}).get("split", ""),
+            )
+            exit_status = info.get("exit_status")
+            result = info.get("submission")
+            set_span_attributes(
+                span,
                 {
-                    "info": {
-                        "exit_status": exit_status,
-                        "submission": result,
-                        **extra_info,
-                    },
-                    "instance_id": instance_id,
+                    "mini.agent_exit_status": exit_status,
+                    "output.value": preview_json(info) if info is not None else None,
                 },
             )
-            logger.info(f"Saved trajectory to '{traj_path}'")
-        update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
-        progress_manager.on_instance_end(instance_id, exit_status)
+            mark_span_ok(span)
+        except Exception as e:
+            logger.error(f"Error processing instance {instance_id}: {e}", exc_info=True)
+            exit_status, result = type(e).__name__, ""
+            extra_info = {"traceback": traceback.format_exc(), "exception_str": str(e)}
+            mark_span_error(span, e)
+        finally:
+            if agent is not None:
+                traj_path = instance_dir / f"{instance_id}.traj.json"
+                agent.save(
+                    traj_path,
+                    {
+                        "info": {
+                            "exit_status": exit_status,
+                            "submission": result,
+                            **extra_info,
+                        },
+                        "instance_id": instance_id,
+                    },
+                )
+                logger.info(f"Saved trajectory to '{traj_path}'")
+            if env is not None and hasattr(env, "cleanup"):
+                env.cleanup()
+            update_preds_file(output_dir / "preds.json", instance_id, model.config.model_name, result)
+            progress_manager.on_instance_end(instance_id, exit_status)
 
 
 def filter_instances(
@@ -251,6 +317,7 @@ def main(
     configs.append({
         "environment": {"environment_class": environment_class or UNSET},
         "model": {"model_name": model or UNSET, "model_class": model_class or UNSET},
+        "run": {"subset": subset, "split": split},
     })
     config = recursive_merge(*configs)
 

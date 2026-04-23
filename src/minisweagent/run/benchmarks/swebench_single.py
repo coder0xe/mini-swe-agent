@@ -1,9 +1,12 @@
 """Run on a single SWE-Bench instance."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 import typer
 from datasets import load_dataset
+from opentelemetry import trace
 
 from minisweagent import global_config_dir
 from minisweagent.agents import get_agent
@@ -15,11 +18,13 @@ from minisweagent.run.benchmarks.swebench import (
 )
 from minisweagent.utils.log import logger
 from minisweagent.utils.serialize import UNSET, recursive_merge
+from minisweagent.utils.tracing import mark_span_error, mark_span_ok, preview_json, set_openinference_kind, set_span_attributes
 
 DEFAULT_OUTPUT_FILE = global_config_dir / "last_swebench_single_run.traj.json"
 DEFAULT_CONFIG_FILE = builtin_config_dir / "benchmarks" / "swebench.yaml"
 
 app = typer.Typer(rich_markup_mode="rich", add_completion=False)
+tracer = trace.get_tracer(__name__)
 
 _CONFIG_SPEC_HELP_TEXT = """Path to config files, filenames, or key-value pairs.
 
@@ -83,17 +88,62 @@ def main(
         "environment": {
             "environment_class": environment_class or UNSET,
         },
+        "run": {
+            "subset": subset,
+            "split": split,
+        },
     })
     config = recursive_merge(*configs)
 
-    env = get_sb_environment(config, instance)
-    agent = get_agent(
-        get_model(config=config.get("model", {})),
-        env,
-        config.get("agent", {}),
-        default_type="interactive",
-    )
-    agent.run(instance["problem_statement"])
+    with tracer.start_as_current_span("benchmark.instance_run") as span:
+        set_openinference_kind(span, "AGENT")
+        set_span_attributes(
+            span,
+            {
+                "mini.instance_id": instance.get("instance_id"),
+                "mini.run.subset": subset,
+                "mini.run.split": split,
+                "mini.output_path": str(output) if output else "",
+                "input.value": instance.get("problem_statement", ""),
+                "metadata": preview_json(
+                    {
+                        "instance_id": instance.get("instance_id"),
+                        "subset": subset,
+                        "split": split,
+                    }
+                ),
+            },
+        )
+
+        env = None
+        try:
+            env = get_sb_environment(config, instance)
+            agent = get_agent(
+                get_model(config=config.get("model", {})),
+                env,
+                config.get("agent", {}),
+                default_type="interactive",
+            )
+            info = agent.run(
+                instance["problem_statement"],
+                instance_id=instance["instance_id"],
+                subset=subset,
+                split=split,
+            )
+            set_span_attributes(
+                span,
+                {
+                    "mini.agent_exit_status": info.get("exit_status") if isinstance(info, dict) else None,
+                    "output.value": preview_json(info) if info is not None else None,
+                },
+            )
+            mark_span_ok(span)
+        except Exception as exc:
+            mark_span_error(span, exc)
+            raise
+        finally:
+            if env is not None and hasattr(env, "cleanup"):
+                env.cleanup()
 
 
 if __name__ == "__main__":
